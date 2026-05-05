@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SOW Report Automation UI</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="bg-glow bg-glow-1"></div>
+    <div class="bg-glow bg-glow-2"></div>
+
+    <div class="app">
+      <header class="card hero">
+        <div class="hero-title-wrap">
+          <span class="badge">Report Automation</span>
+          <h1>📊 SOW to Google Sheets</h1>
+          <p>Upload your SOW and generate a polished Task Tracker + Timeline in one flow.</p>
+        </div>
+        <div class="hero-pills">
+          <span class="pill">Drag & Drop</span>
+          <span class="pill">PDF / DOCX / TXT</span>
+          <span class="pill">Drive Link Output</span>
+        </div>
+      </header>
+
+      <section class="card upload-section">
+        <div class="section-head">
+          <h2>Upload SOW File</h2>
+          <span class="muted">Secure local processing via backend API</span>
+        </div>
+        <div class="drop-zone" id="dropZone" tabindex="0" role="button" aria-label="Upload SOW file">
+          <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+            <path d="M24 2L24 34M8 18L24 2L40 18" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M10 40H38" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+          <h3>Drag and drop your SOW here</h3>
+          <p>or click to browse from your device</p>
+          <div class="file-types">Supported: PDF, DOCX, TXT</div>
+          <input type="file" id="fileInput" accept=".pdf,.docx,.txt" />
+        </div>
+
+        <div id="uploadStatus" class="status-banner hidden"></div>
+      </section>
+
+      <section class="card result-section hidden" id="resultSection">
+        <h2>✅ Report Generated</h2>
+        <div class="result-card">
+          <p><strong>File:</strong> <span id="resultFilename"></span></p>
+          <p><strong>Status:</strong> <span id="resultStatus"></span></p>
+          <div id="driveLink" class="drive-link hidden">
+            <a id="driveLinkHref" href="#" target="_blank" rel="noreferrer">
+              🔗 Open Google Sheet
+            </a>
+          </div>
+          <div id="resultError" class="error hidden"></div>
+        </div>
+        <button id="resetBtn" class="secondary">Process another file</button>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <h2>Recent Reports</h2>
+          <p id="statusLine">Loading...</p>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>File</th>
+                <th>Size (KB)</th>
+                <th>Download</th>
+              </tr>
+            </thead>
+            <tbody id="reportsTbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>ℹ️ How it works</h2>
+        <ol>
+          <li>Upload a SOW file (PDF, DOCX, or TXT)</li>
+          <li>Backend parses the file and extracts tasks, phases, timeline</li>
+          <li>Generates a Google Sheet with Task Tracker (Sheet1) + Timeline (Sheet2)</li>
+          <li>Returns the Google Sheets link for instant access</li>
+        </ol>
+      </section>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
