@@ -8,7 +8,7 @@ __pycache__/
 .DS_Store
 *.xlsx
 *.png
-.json
+*.json
 *.pptx
 *.csv
 *.pdf
