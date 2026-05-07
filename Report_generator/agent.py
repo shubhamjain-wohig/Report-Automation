@@ -75,12 +75,11 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
 from googleapiclient.errors import HttpError
-
-# ── ADK ───────────────────────────────────────────────────────────────────────
 from google.adk.agents import LlmAgent, SequentialAgent
 from google.adk.artifacts.artifact_util import parse_artifact_uri
 from google.adk.tools import ToolContext
 from google.genai import types as genai_types
+from google.genai import Client as GenaiClient
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ENVIRONMENT
@@ -100,6 +99,461 @@ APP_ROOT             = os.path.abspath(os.path.join(os.path.dirname(__file__), "
 GEMINI_MODEL         = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
 RETRY_ATTEMPTS       = int(os.environ.get("RETRY_ATTEMPTS",    "5"))
 RETRY_DELAY          = float(os.environ.get("RETRY_INITIAL_DELAY", "2"))
+
+def _get_genai_client() -> GenaiClient:
+    api_key = (
+        os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+        or os.environ.get("GOOGLE_GENAI_API_KEY")
+    )
+    if not api_key:
+        raise ValueError(
+            "Missing Gemini API key. Set GEMINI_API_KEY or GOOGLE_API_KEY."
+        )
+    return GenaiClient(api_key=api_key)
+
+
+def _generate_executive_summary_llm(completed_tasks, in_progress_tasks, upcoming_tasks) -> str:
+    """Use LLM to generate a 60-word narrative executive summary."""
+    if not completed_tasks and not in_progress_tasks and not upcoming_tasks:
+        return "This week involved planning and coordination activities. Team remains aligned on project objectives."
+    
+    # Build task summary for LLM
+    completed = ", ".join(completed_tasks[:3]) if completed_tasks else "none"
+    in_progress = ", ".join(in_progress_tasks[:3]) if in_progress_tasks else "none"
+    upcoming = ", ".join(upcoming_tasks[:3]) if upcoming_tasks else "none"
+    
+    prompt = f"""Write a 60-word executive summary for a weekly project status report.
+
+Completed tasks: {completed}
+In progress: {in_progress}
+Upcoming: {upcoming}
+
+Requirements:
+- Write in first person plural ("we focused", "our team")
+- No numbers, percentages, or stats
+- Sound natural, like a story
+- Focus on what was accomplished and what's next
+- Exactly 60 words"""
+
+    try:
+        client = _get_genai_client()
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=_RETRY_CONFIG,
+        )
+        if response.text:
+            return response.text.strip()
+    except Exception as e:
+        print(f"[DEBUG] LLM summary generation error: {e}")
+    
+    # Fallback if LLM fails
+    if completed_tasks:
+        return f"This week we focused on {completed_tasks[0].lower()}. Moving forward, our efforts center on {in_progress_tasks[0].lower() if in_progress_tasks else 'ongoing development'}."
+    return "Project progress continues with active development and planning."
+
+
+def _populate_slide_fields_llm(placeholder_map, task_data_rows) -> dict:
+    """Use LLM to populate slide fields based on task data."""
+    
+    # Build task context for LLM
+    tasks_text = ""
+    if task_data_rows and len(task_data_rows) > 1:
+        header = [str(h).strip().lower() for h in task_data_rows[0]]
+        task_idx = next((i for i, h in enumerate(header) if "task" in h), None)
+        module_idx = next((i for i, h in enumerate(header) if "module" in h), None)
+        status_idx = next((i for i, h in enumerate(header) if "status" in h), None)
+        for row in task_data_rows[1:8]:  # First 7 tasks
+            if not row:
+                continue
+            task_val = ""
+            if task_idx is not None and len(row) > task_idx and row[task_idx]:
+                task_val = str(row[task_idx]).strip()
+            if not task_val and row:
+                task_val = str(row[0]).strip()
+            if not task_val:
+                continue
+            module_val = ""
+            if module_idx is not None and len(row) > module_idx and row[module_idx]:
+                module_val = str(row[module_idx]).strip()
+            status_val = ""
+            if status_idx is not None and len(row) > status_idx and row[status_idx]:
+                status_val = str(row[status_idx]).strip()
+            elif row and row[-1]:
+                status_val = str(row[-1]).strip()
+            if module_val:
+                tasks_text += f"- {task_val} | Module: {module_val} | Status: {status_val or 'Unknown'}\n"
+            else:
+                tasks_text += f"- {task_val} | Status: {status_val or 'Unknown'}\n"
+    
+    # ── IMPROVED PROMPT ────────────────────────────────────────────────────
+    prompt = f"""You are creating professional content for a Google Slides weekly status report.
+
+Task data from spreadsheet:
+{tasks_text}
+
+CRITICAL FORMATTING RULES — follow exactly:
+
+1. EXECUTIVE SUMMARY (60 words, narrative paragraph, first-person plural, no bullets, no numbers)
+
+2. KEY ACTIVITIES COMPLETED / IN PROGRESS — use this EXACT two-level structure:
+   • Bold module/category name (e.g. "BigQuery Data Architecture")
+     ○ One concise action sentence describing what was done
+     ○ Another concise action sentence if needed
+   • Bold next module/category name
+     ○ One concise action sentence
+
+3. KEY ACTIVITIES UPCOMING — same two-level structure:
+   • Bold deliverable/category name (e.g. "Business Logic Alignment")
+     ○ One concise action sentence describing what will be done
+
+FORMAT RULES:
+- Level 1 (•): Bold category/module name only — NO action verbs, just the topic label
+- Level 2 (○): Concise complete sentence describing the specific activity (max 15 words)
+- Group related completed AND in-progress tasks together under one bold heading
+- NEVER use semicolons to chain multiple actions in one bullet
+- NEVER use long run-on sentences with ";" separating tasks
+- Each ○ sub-bullet must be a standalone, complete, short sentence
+- Max 3 level-1 bullets per section, max 2 sub-bullets per level-1
+
+EXAMPLE OUTPUT for "Key Activities Completed":
+• BigQuery Data Architecture
+  ○ Successfully created and validated views for all data sources within BigQuery.
+• NLP-to-SQL Development
+  ○ Developed the initial version of the NLP-to-SQL output agent.
+  ○ Integrated a Looker dashboard to visualize agent-generated insights.
+• Advanced Agent Features (In Progress)
+  ○ Developing a data mining agent capable of performing automated web searches.
+  ○ Integrating Google Maps API into the NLP agent for geospatial intelligence.
+
+Return ONLY valid JSON with these exact keys:
+- "Executive Summary" (60-word narrative paragraph, no bullets)
+- "Key Activities Completed" (two-level bullet structure as shown above)
+- "Key Activities In Progress" (two-level bullet structure — only if tasks differ from completed section)
+- "Key Activities Upcoming" (two-level bullet structure as shown above)
+
+JSON format:
+{{
+  "Executive Summary": "This week we focused on...",
+  "Key Activities Completed": "• Module Name\\n  ○ Concise sentence.\\n• Another Module\\n  ○ Concise sentence.",
+  "Key Activities In Progress": "• Module Name\\n  ○ Concise sentence.",
+  "Key Activities Upcoming": "• Deliverable Name\\n  ○ Concise sentence."
+}}
+
+Return ONLY valid JSON, no extra text or markdown backticks:"""
+
+    try:
+        client = _get_genai_client()
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=_RETRY_CONFIG,
+        )
+        
+        # Parse JSON from response
+        text = response.text.strip()
+        if "{" in text and "}" in text:
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            json_str = text[start:end]
+            result = json.loads(json_str)
+            print(f"[DEBUG] LLM field population success: {list(result.keys())}")
+            return result
+    except Exception as e:
+        print(f"[DEBUG] LLM field population error: {e}")
+    
+    return {}
+
+
+def _fill_slide2_via_llm(slides_svc, presentation_id: str, placeholder_map: dict, task_data: list):
+    """
+    Fetch all shapes on slide 2, use LLM to determine what content belongs
+    in each shape based on its existing text/placeholder hint, then directly
+    overwrite the text. This bypasses find-and-replace entirely.
+    """
+    try:
+        prs = slides_svc.presentations().get(presentationId=presentation_id).execute()
+        all_slides = prs.get("slides", [])
+        
+        if len(all_slides) < 2:
+            print("[DEBUG _fill_slide2] Less than 2 slides found")
+            return
+        
+        slide2 = all_slides[1]  # 0-indexed → slide 2
+        
+        # Collect all text shapes on slide 2 with their current text
+        shapes_info = []
+        for elem in slide2.get("pageElements", []):
+            obj_id = elem.get("objectId", "")
+            title  = elem.get("title", "")
+            shape  = elem.get("shape", {})
+            text_obj = shape.get("text", {})
+            
+            full_text = ""
+            for te in text_obj.get("textElements", []):
+                content = te.get("textRun", {}).get("content", "")
+                if content:
+                    full_text += content
+            
+            full_text = full_text.strip()
+            if full_text or title:
+                shapes_info.append({
+                    "objectId": obj_id,
+                    "title":    title,
+                    "text":     full_text,
+                })
+        
+        print(f"[DEBUG _fill_slide2] Found {len(shapes_info)} text shapes on slide 2")
+        for s in shapes_info:
+            print(f"  → id={s['objectId']}, title='{s['title']}', text='{s['text'][:60]}'")
+        
+        if not shapes_info:
+            print("[DEBUG _fill_slide2] No shapes found on slide 2")
+            return
+        
+        # Build content context for LLM
+        exec_summary    = placeholder_map.get("{{Executive Summary}}", "")
+        completed       = placeholder_map.get("{{Key Activities Completed}}", "")
+        in_progress     = placeholder_map.get("{{Key Activities In Progress}}", "")
+        upcoming        = placeholder_map.get("{{Key Activities Upcoming}}", "")
+        project_name    = placeholder_map.get("{{Project Name}}", "")
+        from_date       = placeholder_map.get("{{From Date}}", "")
+        to_date         = placeholder_map.get("{{To Date}}", "")
+        
+        # Build tasks summary for LLM context
+        task_summary = ""
+        if task_data and len(task_data) > 1:
+            for row in task_data[1:8]:
+                if row and len(row) >= 4:
+                    task_summary += f"- {row[0]} | Status: {row[-1]}\n"
+        
+        shapes_json = json.dumps([
+            {"objectId": s["objectId"], "title": s["title"], "currentText": s["text"]}
+            for s in shapes_info
+        ], indent=2)
+        
+        # ── IMPROVED PROMPT ────────────────────────────────────────────────
+        prompt = f"""You are filling a professional weekly status report slide (Slide 2).
+
+Project: {project_name}
+Period: {from_date} to {to_date}
+
+Available content:
+- Executive Summary (60 words): {exec_summary}
+- Completed Tasks: {completed}
+- In Progress Tasks: {in_progress}
+- Upcoming/To-Do Tasks: {upcoming}
+
+These are the text shapes currently on Slide 2 of the Google Slides presentation:
+{shapes_json}
+
+Your task: For each shape, decide what content to place in it based on its "currentText" placeholder.
+
+CRITICAL FORMATTING RULES:
+
+Executive Summary shape:
+- Exactly 60 words, first person plural ("we", "our team"), narrative prose
+- NO bullet points, NO bold markers, NO semicolons chaining tasks
+
+Activities shapes — preserve ORIGINAL task descriptions (DO NOT truncate):
+
+Completed / In Progress activities shape — use this structure:
+• Bold Category Name (from original task, use exact wording)
+  Full original task description (preserve ALL words, do not abbreviate)
+• Bold Next Category
+  Full original task description
+
+Upcoming / To-Do activities shape — same structure:
+• Bold Deliverable Name
+  Full original task description
+
+FORMAT RULES:
+- Level 1 bullet (•): bold category/module label — use exact task words
+- Level 2 bullet: Include the FULL original task description (no word limit)
+- NEVER truncate or shorten task descriptions
+- Include all tasks (no limit on number of bullets)
+- If a shape is a title/header (short text like "Weekly Status"), keep original or use project name
+- If a shape doesn't match any category, set "content" to null
+
+EXAMPLE of correct format (preserve full task descriptions):
+• Requirements & Discovery Workshops
+  Conduct Requirements & Discovery Workshops; Finalize Architecture & Solution Design.
+• Web Portal & File Validation
+  Build a secure web portal for uploading/validating engineering data files/templates (Excel/CSV); Implement automated schema detection and file validation.
+• Orchestration Layer
+  Create intelligent orchestration layer; Interpret embedded instructions; Extract customer identifiers; Process default values, cross-column dependencies, formula-based computations...
+
+Return ONLY a valid JSON array, no extra text, no markdown:
+[
+  {{"objectId": "...", "content": "text to place here or null"}},
+  ...
+]"""
+
+        try:
+            client = _get_genai_client()
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=_RETRY_CONFIG,
+            )
+            text = response.text.strip()
+            
+            # Parse JSON
+            if "[" in text and "]" in text:
+                start = text.find("[")
+                end   = text.rfind("]") + 1
+                assignments = json.loads(text[start:end])
+            else:
+                print("[DEBUG _fill_slide2] LLM returned no valid JSON array")
+                return
+            
+            print(f"[DEBUG _fill_slide2] LLM assigned {len(assignments)} shapes")
+        except Exception as e:
+            print(f"[DEBUG _fill_slide2] LLM call failed: {e}")
+            return
+        
+        # Build batchUpdate requests to replace text in each shape
+        requests = []
+        shape_lookup = {}
+        for slide in all_slides:
+            for elem in slide.get("pageElements", []):
+                obj_id = elem.get("objectId", "")
+                if obj_id:
+                    shape_lookup[obj_id] = elem.get("shape", {})
+        
+        for assignment in assignments:
+            obj_id = assignment.get("objectId", "")
+            content = assignment.get("content")
+            
+            if not obj_id or content is None:
+                continue
+            
+            content = str(content).strip()
+            if not content:
+                continue
+            
+            # Get original text to check if this is a template header
+            original_text = ""
+            for s in shapes_info:
+                if s["objectId"] == obj_id:
+                    original_text = s.get("text", "").strip()
+                    break
+            
+            # If original text is all caps (template header), DON'T modify at all
+            if original_text.isupper() and len(original_text) < 60:
+                print(f"[DEBUG] {obj_id}: SKIP header - keep original: '{original_text}'")
+                continue
+            
+            # NEW: If content is all caps (like a header), use original text instead
+            if content.isupper() and len(content) < 60:
+                print(f"[DEBUG] {obj_id}: SKIP new header - keep original: '{original_text}'")
+                continue
+            
+            # Check if shape has existing text before deleting
+            shape = shape_lookup.get(obj_id, {})
+            has_text = any(
+                te.get("textRun", {}).get("content", "").strip()
+                for te in shape.get("text", {}).get("textElements", [])
+            )
+            
+            if has_text:
+                requests.append({
+                    "deleteText": {
+                        "objectId": obj_id,
+                        "textRange": {"type": "ALL"}
+                    }
+                })
+            requests.append({
+                "insertText": {
+                    "objectId":       obj_id,
+                    "insertionIndex": 0,
+                    "text":           content,
+                }
+            })
+            requests.append({
+                "insertText": {
+                    "objectId":       obj_id,
+                    "insertionIndex": 0,
+                    "text":           content,
+                }
+            })
+            
+            # Determine style based on content type
+            content_lower = content.lower()
+            # Check if content has bullet point heading (• at start = heading)
+            is_heading_bullet = content.strip().startswith("•")
+            
+            # Set font styling based on content type
+            # Montserrat may not be available, fallback to Arial
+            if is_heading_bullet:
+                # Bold heading with bullet
+                font_size = 11
+                font_weight = True  # BOLD
+                font_family = "Montserrat"
+            else:  # Regular content
+                font_size = 11
+                font_weight = False  # NORMAL
+                font_family = "Montserrat"
+            
+            # Always delete existing text first, then insert new, then style
+            if has_text:
+                requests.append({
+                    "deleteText": {
+                        "objectId": obj_id,
+                        "textRange": {"type": "ALL"}
+                    }
+                })
+            
+            # Insert new content
+            requests.append({
+                "insertText": {
+                    "objectId":       obj_id,
+                    "insertionIndex": 0,
+                    "text":           content,
+                }
+            })
+            
+            # Skip styling for header/title shapes (keep original template text as-is)
+            # Only style shapes that have content from our generated data
+            template_headers = ["executive summary", "key activities", "completed", "in progress", "upcoming", "period"]
+            content_lower = content.lower()
+            is_template_header = any(h in content_lower for h in template_headers) and len(content) < 40
+            
+            if is_template_header:
+                # Skip styling for template headers
+                print(f"[DEBUG] {obj_id}: SKIP styling (template header): '{content[:30]}...'")
+            else:
+                # Apply styling to generated content
+                requests.append({
+                    "updateTextStyle": {
+                        "objectId": obj_id,
+                        "textRange": {"type": "ALL"},
+                        "style": {
+                            "fontFamily": font_family,
+                            "fontSize": {"magnitude": font_size, "unit": "PT"},
+                            "bold": font_weight,
+                        },
+                        "fields": "fontFamily,fontSize,bold"
+                    }
+                })
+                weight_str = "BOLD" if font_weight else "NORMAL"
+                print(f"[DEBUG] {obj_id}: '{content[:30]}...' set to {font_size}pt {weight_str} {font_family}")
+        
+        if requests:
+            slides_svc.presentations().batchUpdate(
+                presentationId=presentation_id,
+                body={"requests": requests}
+            ).execute()
+            print(f"[DEBUG _fill_slide2] Applied {len(requests)} text updates to slide 2")
+        else:
+            print("[DEBUG _fill_slide2] No requests to apply")
+    
+    except Exception as e:
+        import traceback
+        print(f"[DEBUG _fill_slide2] Error (non-fatal): {e}")
+        traceback.print_exc()
+
 
 # Slide canvas dimensions (inches → used for smart-scaling)
 SLIDE_W_IN = 10.0   # standard widescreen width
@@ -639,6 +1093,15 @@ async def extract_excel_data(excel_file_path: str, *, tool_context: ToolContext)
         success (bool), project_name (str), placeholder_count (int),
         timeline_range (str), error (str)
     """
+    import re
+    
+    project_name_from_msg = None
+    match = re.search(r"\(Project Name:\s*([^)]+)\)", excel_file_path)
+    if match:
+        project_name_from_msg = match.group(1).strip()
+        excel_file_path = excel_file_path.replace(match.group(0), "").strip()
+        print(f"[DEBUG] Extracted project name from message: {project_name_from_msg}")
+    
     # Check if it's a Google Sheets URL - just store URL, don't download
     path = ""
     if "docs.google.com/spreadsheets" in (excel_file_path or ""):
@@ -795,6 +1258,10 @@ async def extract_excel_data(excel_file_path: str, *, tool_context: ToolContext)
     # Use Excel filename as project name (without extension)
     file_name = os.path.basename(path)
     project_name_from_file = os.path.splitext(file_name)[0] if file_name else "Project"
+    if project_name_from_file.startswith("upload_"):
+        project_name_from_file = "Project"
+    if project_name_from_msg:
+        project_name_from_file = project_name_from_msg
     
     # Update meta with filename so placeholder map gets correct value
     meta["project_name"] = project_name_from_file
@@ -1705,6 +2172,18 @@ def build_slides_report(*, tool_context: ToolContext) -> dict:
             if sheet_match:
                 sheet_id = sheet_match.group(1)
                 
+                # Get spreadsheet metadata to get the title
+                sheet_meta = sheets_service.spreadsheets().get(
+                    spreadsheetId=sheet_id,
+                    fields="properties(title)"
+                ).execute()
+                sheet_title = sheet_meta.get("properties", {}).get("title", "Weekly Report")
+                print(f"[DEBUG] Google Sheet title: {sheet_title}")
+                
+                # Store project name from sheet title
+                if not project_name or project_name in ("Report", "Weekly Report"):
+                    project_name = sheet_title
+                
                 # Get data from Task Tracker sheet
                 result = sheets_service.spreadsheets().values().get(
                     spreadsheetId=sheet_id,
@@ -1720,12 +2199,27 @@ def build_slides_report(*, tool_context: ToolContext) -> dict:
                     completed_tasks = []
                     in_progress_tasks = []
                     upcoming_tasks = []
+                    from datetime import datetime
+                    
+                    header = [str(h).strip().lower() for h in task_data[0]]
+                    task_idx = next((i for i, h in enumerate(header) if "task" in h), None)
+                    status_idx = next((i for i, h in enumerate(header) if "status" in h), None)
                     
                     # Parse task data to extract activities
                     for row in task_data[1:]:  # Skip header
                         if len(row) >= 4:
-                            task_name = str(row[0]) if row[0] else ""
-                            status = str(row[-1]).lower() if row[-1] else ""
+                            task_name = ""
+                            if task_idx is not None and len(row) > task_idx and row[task_idx]:
+                                task_name = str(row[task_idx]).strip()
+                            if not task_name and row:
+                                task_name = str(row[0]).strip()
+                            status = ""
+                            if status_idx is not None and len(row) > status_idx and row[status_idx]:
+                                status = str(row[status_idx]).lower().strip()
+                            elif row and row[-1]:
+                                status = str(row[-1]).lower().strip()
+                            if not task_name:
+                                continue
                             
                             if "completed" in status:
                                 completed_tasks.append(task_name)
@@ -1734,37 +2228,163 @@ def build_slides_report(*, tool_context: ToolContext) -> dict:
                             else:
                                 upcoming_tasks.append(task_name)
                             
-                            # Extract dates
+                            # Extract dates - parse and track min/max
+                            parsed_dates = []
                             for cell in row:
-                                if cell and ("/" in str(cell) or "-" in str(cell)):
-                                    dates.append(str(cell))
+                                if cell:
+                                    cell_str = str(cell).strip()
+                                    for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"]:
+                                        try:
+                                            d = datetime.strptime(cell_str, fmt)
+                                            parsed_dates.append(d)
+                                            break
+                                        except:
+                                            pass
+                            
+                            if parsed_dates:
+                                min_date = min(parsed_dates)
+                                max_date = max(parsed_dates)
+                                if not dates:
+                                    dates = [min_date, max_date]
+                                else:
+                                    if min_date < dates[0]:
+                                        dates[0] = min_date
+                                    if max_date > dates[-1]:
+                                        dates[-1] = max_date
                     
-                    # Build executive summary from tasks
-                    summary = f"Project weekly status report covering {len(task_data)-1} tasks. "
-                    summary += f"{len(completed_tasks)} completed, {len(in_progress_tasks)} in progress, {len(upcoming_tasks)} upcoming."
+                    # Generate executive summary using LLM
+                    exec_summary = _generate_executive_summary_llm(
+                        completed_tasks, in_progress_tasks, upcoming_tasks
+                    )
                     
+                    # ── Build structured two-level bullet content with LLM-generated headings ──────────────
+                    # Use LLM to create short headings from tasks (without rephrasing tasks)
+                    
+                    # Prepare task lists for heading generation
+                    completed_raw = "\n".join(f"{i+1}. {t}" for i, t in enumerate(completed_tasks[:5])) if completed_tasks else ""
+                    in_progress_raw = "\n".join(f"{i+1}. {t}" for i, t in enumerate(in_progress_tasks[:5])) if in_progress_tasks else ""
+                    upcoming_raw = "\n".join(f"{i+1}. {t}" for i, t in enumerate(upcoming_tasks[:5])) if upcoming_tasks else ""
+                    
+                    _heading_prompt = f"""Create short category headings for each task below.
+
+RULES:
+- Extract the MAIN TOPIC from each task as heading (2-5 words, title case)
+- DO NOT rephrase the task content - keep it exactly as given
+- Keep headings simple and descriptive
+
+Completed/In-Progress tasks:
+{completed_raw}
+
+In-Progress tasks:
+{in_progress_raw}
+
+Upcoming tasks:
+{upcoming_raw}
+
+OUTPUT FORMAT (exact JSON):
+For each task, output a heading and keep the original task:
+{{
+  "tasks": [
+    {{"heading": "2-word heading", "task": "original task exactly as given"}},
+    ...
+  ]
+}}
+
+Return ONLY valid JSON:"""
+
+                    try:
+                        client = _get_genai_client()
+                        _head_response = client.models.generate_content(
+                            model=GEMINI_MODEL,
+                            contents=_heading_prompt,
+                            config=_RETRY_CONFIG,
+                        )
+                        _head_text = _head_response.text.strip()
+                        
+                        # Parse JSON
+                        if "{" in _head_text:
+                            _head_json = json.loads(_head_text[_head_text.find("{"):_head_text.rfind("}")+1])
+                            tasks_list = _head_json.get("tasks", [])
+                            
+                            # Build bullets with LLM-generated headings
+                            completed_lines = []
+                            in_progress_lines = []
+                            upcoming_lines = []
+                            
+                            for i, task_info in enumerate(tasks_list):
+                                heading = task_info.get("heading", "").strip()
+                                task = task_info.get("task", "").strip()
+                                if heading and task:
+                                    if i < len(completed_tasks):
+                                        completed_lines.append(f"• {heading}\n  {task}")
+                                    elif i < len(completed_tasks) + len(in_progress_tasks):
+                                        in_progress_lines.append(f"• {heading}\n  {task}")
+                                    else:
+                                        upcoming_lines.append(f"• {heading}\n  {task}")
+                            
+                            completed_bullets = "\n\n".join(completed_lines) if completed_lines else "No completed tasks"
+                            in_progress_bullets = "\n\n".join(in_progress_lines) if in_progress_lines else "No in-progress tasks"
+                            upcoming_bullets = "\n\n".join(upcoming_lines) if upcoming_lines else "No upcoming tasks"
+                            
+                            print(f"[DEBUG] Headings generated: {len(tasks_list)} tasks")
+                        else:
+                            raise ValueError("No JSON")
+                    except Exception as _he:
+                        print(f"[DEBUG] Heading LLM failed ({_he}), using direct format")
+                        # Fallback - use direct format without headings
+                        completed_lines = [f"• {t}" for t in completed_tasks[:5]]
+                        in_progress_lines = [f"• {t}" for t in in_progress_tasks[:5]]
+                        upcoming_lines = [f"• {t}" for t in upcoming_tasks[:5]]
+                        
+                        completed_bullets = "\n\n".join(completed_lines) if completed_lines else "No completed tasks"
+                        in_progress_bullets = "\n\n".join(in_progress_lines) if in_progress_lines else "No in-progress tasks"
+                        upcoming_bullets = "\n\n".join(upcoming_lines) if upcoming_lines else "No upcoming tasks"
+
+                    except Exception as _se:
+                        print(f"[DEBUG] Heading generation failed ({_se}), using fallback")
+                        # Ultimate fallback
+                        completed_lines = [f"• {t}" for t in completed_tasks[:5]]
+                        in_progress_lines = [f"• {t}" for t in in_progress_tasks[:5]]
+                        upcoming_lines = [f"• {t}" for t in upcoming_tasks[:5]]
+                        
+                        completed_bullets = "\n".join(completed_lines) if completed_lines else "No completed tasks"
+                        in_progress_bullets = "\n".join(in_progress_lines) if in_progress_lines else "No in-progress tasks"
+                        upcoming_bullets = "\n".join(upcoming_lines) if upcoming_lines else "No upcoming tasks"
+                    
+                    print(f"[DEBUG] Structured bullets created with headings")
+
                     # Update placeholders with actual data from sheet
                     placeholder_map = {
                         "{{Project Name}}": project_name or "Weekly Report",
                         "{{From Date}}": _format_indian_date(dates[0]) if dates else "",
-                        "{{To Date}}": _format_indian_date(dates[-1]) if len(dates) > 1 else "",
-                        "{{Executive Summary}}": summary,
-                        "{{Key Activities Completed}}": ", ".join(completed_tasks[:5]),
-                        "{{Key Activities In Progress}}": ", ".join(in_progress_tasks[:5]),
-                        "{{Key Activities Upcoming}}": ", ".join(upcoming_tasks[:5]),
+                        "{{To Date}}": _format_indian_date(dates[-1]) if dates and len(dates) > 1 else "",
+                        "{{Executive Summary}}": exec_summary,
+                        "{{Key Activities Completed}}": completed_bullets,
+                        "{{Key Activities In Progress}}": in_progress_bullets,
+                        "{{Key Activities Upcoming}}": upcoming_bullets,
                         # Status indicators for Slide 3
                         "{{Completed}}": str(len(completed_tasks)),
                         "{{In Progress}}": str(len(in_progress_tasks)),
                         "{{Yet to Start}}": str(len(upcoming_tasks)),
                         "{{Delayed}}": "0",
                     }
+                    
+                    # Skip LLM rephrasing - use task data directly as-is
+                    # (LLM enhancement disabled to preserve original task names)
+                    print(f"[DEBUG] Using direct task data for slide content")
+
                     print(f"[DEBUG] Extracted placeholders: {list(placeholder_map.keys())}")
                     print(f"[DEBUG] Status counts - Completed: {len(completed_tasks)}, In Progress: {len(in_progress_tasks)}, Upcoming: {len(upcoming_tasks)}")
                     
+                    # Save to state so build_slides can use it
+                    tool_context.state["placeholder_map"] = placeholder_map
+                    tool_context.state["project_name"] = project_name
+                
                 # Get timeline data for image
                 # Try different sheet name variations
                 sheet_variants = ["Timeline 1", "Timeline1", "Timeline", "timeline"]
                 timeline_data = []
+                thumbnail_link = ""
                 
                 # First, try to get the full spreadsheet with charts
                 try:
@@ -1821,8 +2441,6 @@ def build_slides_report(*, tool_context: ToolContext) -> dict:
                         if pdf_link:
                             print(f"[DEBUG] PDF export available")
                             
-                        # Try PNG export if available (doesn't exist natively but sometimes available)
-                        
                         # Get thumbnail - this is overall spreadsheet, not specific sheet
                         thumbnail = drive.files().get(
                             fileId=sheet_id,
@@ -1914,7 +2532,81 @@ def build_slides_report(*, tool_context: ToolContext) -> dict:
         f"https://docs.google.com/presentation/d/{slides_id}/edit"
     )
 
-    # ── 2. Find and Replace (exact match) ─
+    # ── 2a. Fill Slide 2 text boxes by Alt Text Title ────────────────
+    # More reliable than find-and-replace for nested text boxes
+    # Map Alt Text titles (set in template) to placeholder_map keys
+    alt_text_map = {
+        "{{EXECUTIVE_SUMMARY}}": placeholder_map.get("{{Executive Summary}}", ""),
+        "{{COMPLETED_ACTIVITIES}}": placeholder_map.get("{{Key Activities Completed}}", "") + "\n\n" + placeholder_map.get("{{Key Activities In Progress}}", ""),
+        "{{UPCOMING_ACTIVITIES}}": placeholder_map.get("{{Key Activities Upcoming}}", ""),
+    }
+    print(f"[DEBUG] Alt text map with data: {[(k, len(v)) for k,v in alt_text_map.items()]}")
+    
+    # Fetch all slides to find shapes by their title (Alt Text)
+    try:
+        prs = slides.presentations().get(presentationId=slides_id).execute()
+        all_slides = prs.get("slides", [])
+        
+        # Debug: log all element titles/descriptions found in slides
+        all_titles = []
+        all_descriptions = []
+        for slide in all_slides:
+            for elem in slide.get("pageElements", []):
+                title = (elem.get("title", "") or "").strip()
+                desc = (elem.get("description", "") or "").strip()
+                if title:
+                    all_titles.append(title)
+                if desc:
+                    all_descriptions.append(desc)
+        print(f"[DEBUG] All element titles found: {all_titles}")
+        print(f"[DEBUG] All element descriptions found: {all_descriptions}")
+        
+        # Collect update requests for text boxes
+        text_update_requests = []
+        
+        for tag, content in alt_text_map.items():
+            if not content:
+                continue
+            for slide in all_slides:
+                for elem in slide.get("pageElements", []):
+                    elem_title = (elem.get("title", "") or "").strip()
+                    elem_desc = (elem.get("description", "") or "").strip()
+                    elem_id = elem.get("objectId", "")
+                    
+                    if elem_title == tag or elem_desc == tag:
+                        if "shape" in elem:
+                            shape_text = elem.get("shape", {}).get("text", {})
+                            has_text = any(
+                                te.get("textRun", {}).get("content", "").strip()
+                                for te in shape_text.get("textElements", [])
+                            )
+                            if has_text:
+                                text_update_requests.append({
+                                    "deleteText": {
+                                        "objectId": elem_id,
+                                        "textRange": {"type": "ALL"},
+                                    }
+                                })
+                            text_update_requests.append({
+                                "insertText": {
+                                    "objectId": elem_id,
+                                    "insertionIndex": 0,
+                                    "text": content
+                                }
+                            })
+                            print(f"[DEBUG] Alt Text fill: '{tag}' -> '{content[:30]}...'")
+        
+        # Execute batch updates if we have any
+        if text_update_requests:
+            slides.presentations().batchUpdate(
+                presentationId=slides_id,
+                body={"requests": text_update_requests}
+            ).execute()
+            print(f"[DEBUG] Alt Text updates applied: {len(text_update_requests)} fields")
+    except Exception as e:
+        print(f"[DEBUG] Alt Text fill error (non-fatal): {e}")
+    
+    # ── 2b. Find and Replace (exact match) ─
     # Using matchCase: true for exact matching as per template
     replace_requests = []
     for tag, replacement in placeholder_map.items():
@@ -2082,28 +2774,23 @@ def _inject_timeline_image(
     # Google Slides uses EMU (English Metric Units): 1 inch = 914400 EMU
     EMU_PER_INCH = 914400
 
-    if placeholder_pos:
-        # Use the placeholder's own bounding box
-        avail_w_emu = placeholder_pos["width"]
-        avail_h_emu = placeholder_pos["height"]
-        left_emu    = placeholder_pos["translateX"]
-        top_emu     = placeholder_pos["translateY"]
-    else:
-        # No placeholder found — use full slide minus 0.25-inch margin
-        avail_w_emu = int(SLIDE_W_IN * EMU_PER_INCH * 0.95)
-        avail_h_emu = int(SLIDE_H_IN * EMU_PER_INCH * 0.95)
-        left_emu    = int(SLIDE_W_IN * EMU_PER_INCH * 0.025)
-        top_emu     = int(SLIDE_H_IN * EMU_PER_INCH * 0.025)
-        # Use slide 3 (Projected Plan) by default - slides are 0-indexed
-        placeholder_slide_id = slides[2]["objectId"] if len(slides) > 2 else (slides[0]["objectId"] if slides else None)
-        print(f"[DEBUG] Using slide 3 for timeline image: {placeholder_slide_id}")
+    # Force use full slide (ignore placeholder) - set to center and maximize
+    avail_w_emu = int(SLIDE_W_IN * EMU_PER_INCH * 0.95)
+    avail_h_emu = int(SLIDE_H_IN * EMU_PER_INCH * 0.85)
+    left_emu    = int((SLIDE_W_IN * EMU_PER_INCH - avail_w_emu) // 2)  # Center horizontally
+    top_emu     = int((SLIDE_H_IN * EMU_PER_INCH - avail_h_emu) // 2)   # Center vertically
+    
+    # Use slide 3 (Projected Plan) by default - slides are 0-indexed
+    placeholder_slide_id = slides[2]["objectId"] if len(slides) > 2 else (slides[0]["objectId"] if slides else None)
+    print(f"[DEBUG] Using slide 3 for timeline image: {placeholder_slide_id}")
 
     if not placeholder_slide_id:
         raise ValueError("No slides found in the presentation.")
 
-    aspect = img_w_px / img_h_px if img_h_px else 1.0
-
-    # Use exact placeholder dimensions (stretch to fill)
+    print(f"[DEBUG] Image original: {img_w_px}x{img_h_px}px")
+    print(f"[DEBUG] Available space: {avail_w_emu//914000}x{avail_h_emu//914000} inches")
+    
+    # Use full available space (fill the placeholder area)
     fit_w_emu  = avail_w_emu
     fit_h_emu  = avail_h_emu
 
@@ -2421,4 +3108,3 @@ if __name__ == "__main__":
                             print(f"[{author}] {txt[:140]}")
 
     asyncio.run(run())
-    

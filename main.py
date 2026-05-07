@@ -111,6 +111,7 @@ def _create_file_server():
         try:
             temp_path = data.get("temp_path", "")
             file_type = data.get("file_type", "").lower()
+            original_filename = data.get("filename", "")
             
             if not temp_path or not Path(temp_path).exists():
                 return JSONResponse(
@@ -124,7 +125,8 @@ def _create_file_server():
             elif file_type == ".docx":
                 message = f"Generate a weekly report from this SOW DOCX: {temp_path}"
             elif file_type == ".xlsx" or file_type == ".xls":
-                message = f"Generate a weekly report from this SOW Excel file: {temp_path}"
+                original_name = Path(data.get("filename", "")).stem or Path(temp_path).stem.replace("upload_", "")
+                message = f"Generate a weekly report from this SOW Excel file: {temp_path} (Project Name: {original_name})"
             elif file_type == ".txt":
                 with open(temp_path, "r") as f:
                     sow_text = f.read()
