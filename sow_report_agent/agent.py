@@ -337,60 +337,6 @@ def read_docx_sow(file_path: str, *, tool_context: ToolContext) -> dict:
         return {"success": False, "paragraphs": 0, "char_count": 0, "error": str(exc)}
 
 
-def read_excel_sow(file_path: str, *, tool_context: ToolContext) -> dict:
-    """
-    Extract text from a SOW Excel (.xlsx/.xls) file and store in session state.
-    Reads all sheets and their cells to build a structured text representation.
-
-    Args:
-        file_path: Absolute or relative path to an .xlsx/.xls SOW document.
-
-    Returns:
-        success (bool), sheets (int), rows (int), char_count (int), error (str)
-    """
-    try:
-        import openpyxl
-    except ImportError:
-        return {"success": False, "sheets": 0, "rows": 0, "char_count": 0,
-                "error": "openpyxl not installed — run: pip install openpyxl"}
-
-    path = os.path.abspath(os.path.expanduser(file_path.strip()))
-    if not os.path.exists(path):
-        return {"success": False, "sheets": 0, "rows": 0, "char_count": 0,
-                "error": f"File not found: {path}"}
-
-    ext = path.lower().split(".")[-1]
-    if ext not in ("xlsx", "xlsm", "xltx", "xltm", "xls"):
-        return {"success": False, "sheets": 0, "rows": 0, "char_count": 0,
-                "error": f"Not an Excel file (.xlsx/.xls). Got: {ext}"}
-
-    try:
-        wb = openpyxl.load_workbook(path, data_only=True)
-        text_parts = []
-        total_rows = 0
-
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            text_parts.append(f"\n=== Sheet: {sheet_name} ===\n")
-
-            for row in ws.iter_rows(values_only=True):
-                row_text = " | ".join(
-                    str(cell).strip() if cell is not None else ""
-                    for cell in row
-                ).strip()
-                if row_text:
-                    text_parts.append(row_text + "\n")
-                    total_rows += 1
-
-        text = "".join(text_parts).strip()
-        tool_context.state["sow_raw_text"] = text
-        tool_context.state["sow_source"]   = f"EXCEL:{os.path.basename(path)}"
-        return {"success": True, "sheets": len(wb.sheetnames), "rows": total_rows,
-                "char_count": len(text), "error": ""}
-    except Exception as exc:
-        return {"success": False, "sheets": 0, "rows": 0, "char_count": 0, "error": str(exc)}
-
-
 def store_sow_text(sow_text: str, *, tool_context: ToolContext) -> dict:
     """
     Store raw pasted SOW text in session state.
@@ -877,7 +823,7 @@ sow_parser_agent = LlmAgent(
     name="SOWParserAgent",
     model=GEMINI_MODEL,
     description=(
-        "Ingests a SOW from a PDF path, DOCX path, Excel (.xlsx/.xls) path, or raw pasted text "
+        "Ingests a SOW from a PDF path, DOCX path, or raw pasted text "
         "and stores the extracted text in session state."
     ),
     instruction="""
@@ -886,12 +832,12 @@ You ingest SOW documents. Make exactly ONE tool call.
 Decision rules:
 - Message has a path ending in .pdf  → read_pdf_sow(file_path="...")
 - Message has a path ending in .docx → read_docx_sow(file_path="...")
-- Message has a path ending in .xlsx or .xls → read_excel_sow(file_path="...")
 - Message has actual SOW text        → store_sow_text(sow_text="...")
 
-Reply with plain text: success/failure, source type, sheets/pages/paragraphs and chars extracted.
+Reply with plain text: success/failure, source type, chars/pages extracted, confirmation.
+Do not quote SOW content. Do not ask questions.
 """,
-    tools=[read_pdf_sow, read_docx_sow, read_excel_sow, store_sow_text],
+    tools=[read_pdf_sow, read_docx_sow, store_sow_text],
     generate_content_config=_RETRY_CONFIG,
 )
 
